@@ -2,6 +2,7 @@ import "dotenv/config";
 import express, { Request, Response, NextFunction } from "express";
 import { getFirebaseApp } from "./services/firebase";
 import sessionsRouter from "./routes/sessions";
+import usersRouter from "./routes/users";
 
 // Eagerly initialize Firebase so we fail fast on bad config
 getFirebaseApp();
@@ -16,6 +17,7 @@ app.get("/health", (_req: Request, res: Response) => {
 });
 
 app.use("/sessions", sessionsRouter);
+app.use("/users", usersRouter);
 
 // 404 fallthrough
 app.use((_req: Request, res: Response) => {

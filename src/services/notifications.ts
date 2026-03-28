@@ -1,6 +1,5 @@
 import * as admin from "firebase-admin";
 import { getFirestore, getMessaging } from "./firebase";
-import { Device, Platform } from "../types/session";
 
 export interface NotifyPayload {
   title: string;
@@ -17,25 +16,19 @@ const INVALID_TOKEN_CODES = new Set([
 function buildMessage(
   token: string,
   payload: NotifyPayload,
-  platform: Platform
+  // platform unknown at this level — send with both Android + APNs config
 ): admin.messaging.Message {
-  const base: admin.messaging.Message = {
+  return {
     token,
     notification: {
       title: payload.title,
       body: payload.body,
     },
-  };
-
-  if (platform === "android") {
-    base.android = {
+    android: {
       priority: payload.priority === "high" ? "high" : "normal",
-      notification: {
-        sound: "default",
-      },
-    };
-  } else {
-    base.apns = {
+      notification: { sound: "default" },
+    },
+    apns: {
       payload: {
         aps: {
           sound: "default",
@@ -44,56 +37,51 @@ function buildMessage(
             : {}),
         },
       },
-    };
-  }
-
-  return base;
+    },
+  };
 }
 
 export async function sendNotifications(
-  sessionId: string,
-  devices: Device[],
+  userId: string,
   payload: NotifyPayload
 ): Promise<number> {
-  if (devices.length === 0) return 0;
-
   const db = getFirestore();
   const messaging = getMessaging();
 
+  const devicesSnap = await db
+    .collection("users")
+    .doc(userId)
+    .collection("devices")
+    .get();
+
+  if (devicesSnap.empty) return 0;
+
   const results = await Promise.allSettled(
-    devices.map(async (device) => {
-      const message = buildMessage(device.fcmToken, payload, device.platform);
+    devicesSnap.docs.map(async (doc) => {
+      const { fcmToken } = doc.data() as { fcmToken: string };
+      const message = buildMessage(fcmToken, payload);
       try {
         await messaging.send(message);
-        console.log(
-          `[notify] sent to device ${device.deviceId} (session=${sessionId})`
-        );
-        return { success: true, deviceId: device.deviceId };
+        console.log(`[notify] sent to device=${doc.id} user=${userId}`);
+        return true;
       } catch (err: unknown) {
         const fcmErr = err as admin.FirebaseError;
         if (INVALID_TOKEN_CODES.has(fcmErr.code ?? "")) {
           console.warn(
-            `[notify] invalid token for device ${device.deviceId} — removing from session ${sessionId}`
+            `[notify] stale token for device=${doc.id} user=${userId} — removing`
           );
-          await db
-            .collection("sessions")
-            .doc(sessionId)
-            .collection("devices")
-            .doc(device.deviceId)
-            .delete();
+          await doc.ref.delete();
         } else {
           console.error(
-            `[notify] FCM error for device ${device.deviceId}:`,
+            `[notify] FCM error device=${doc.id}:`,
             fcmErr.code,
             fcmErr.message
           );
         }
-        return { success: false, deviceId: device.deviceId };
+        return false;
       }
     })
   );
 
-  return results.filter(
-    (r) => r.status === "fulfilled" && r.value.success
-  ).length;
+  return results.filter((r) => r.status === "fulfilled" && r.value).length;
 }

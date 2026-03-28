@@ -2,10 +2,9 @@ import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import * as admin from "firebase-admin";
 import { z } from "zod";
-import { requireAuth } from "../middleware/requireAuth";
 import { getFirestore } from "../services/firebase";
 import { sendNotifications } from "../services/notifications";
-import { Device, SessionStatus } from "../types/session";
+import { SessionStatus } from "../types/session";
 
 const router = Router();
 
@@ -33,8 +32,7 @@ const NotifySchema = z.object({
 });
 
 const JoinSchema = z.object({
-  fcmToken: z.string().min(1),
-  platform: z.enum(["android", "ios"]),
+  userId: z.string().min(1),
 });
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -63,7 +61,7 @@ async function getSessionOrFail(
   return data;
 }
 
-// ─── CLI-facing routes ────────────────────────────────────────────────────────
+// ─── Routes ──────────────────────────────────────────────────────────────────
 
 // POST /sessions
 router.post("/", async (req: Request, res: Response) => {
@@ -83,14 +81,41 @@ router.post("/", async (req: Request, res: Response) => {
   await sessionRef(sessionId).set({
     agent,
     name,
+    userId: null,
     status: "active" as SessionStatus,
     createdAt: now,
-    updatedAt: now,
     expiresAt,
   });
 
   console.log(`[session] created session=${sessionId} agent=${agent} name="${name}"`);
   res.status(201).json({ sessionId });
+});
+
+// POST /sessions/:id/join
+router.post("/:id/join", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const parse = JoinSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: parse.error.message, code: "VALIDATION_ERROR" });
+    return;
+  }
+
+  const data = await getSessionOrFail(id, res);
+  if (!data) return;
+
+  const { userId } = parse.data;
+  const db = getFirestore();
+  const now = admin.firestore.Timestamp.now();
+
+  // Create users/{userId} doc if it doesn't exist
+  const userRef = db.collection("users").doc(userId);
+  await userRef.set({ createdAt: now }, { merge: true });
+
+  // Link the user to the session
+  await sessionRef(id).update({ userId });
+
+  console.log(`[session] joined session=${id} userId=${userId}`);
+  res.status(200).json({ ok: true });
 });
 
 // PATCH /sessions/:id/status
@@ -105,10 +130,7 @@ router.patch("/:id/status", async (req: Request, res: Response) => {
   const data = await getSessionOrFail(id, res);
   if (!data) return;
 
-  await sessionRef(id).update({
-    status: parse.data.status,
-    updatedAt: admin.firestore.Timestamp.now(),
-  });
+  await sessionRef(id).update({ status: parse.data.status });
 
   console.log(`[session] status updated session=${id} status=${parse.data.status}`);
   res.status(200).json({ ok: true });
@@ -126,20 +148,14 @@ router.post("/:id/notify", async (req: Request, res: Response) => {
   const data = await getSessionOrFail(id, res);
   if (!data) return;
 
-  const devicesSnap = await sessionRef(id).collection("devices").get();
-  const devices: Device[] = devicesSnap.docs.map((doc) => ({
-    deviceId: doc.id,
-    ...(doc.data() as Omit<Device, "deviceId">),
-  }));
-
-  if (devices.length === 0) {
-    console.log(`[notify] no devices registered for session=${id}`);
-    res.status(200).json({ sent: 0 });
+  if (!data.userId) {
+    console.log(`[notify] session=${id} has no linked user — skipping`);
+    res.status(200).json({ skipped: true, reason: "no user linked" });
     return;
   }
 
-  const sent = await sendNotifications(id, devices, parse.data);
-  console.log(`[notify] session=${id} sent=${sent}/${devices.length}`);
+  const sent = await sendNotifications(data.userId as string, parse.data);
+  console.log(`[notify] session=${id} userId=${data.userId} sent=${sent}`);
   res.status(200).json({ sent });
 });
 
@@ -153,84 +169,9 @@ router.delete("/:id", async (req: Request, res: Response) => {
     return;
   }
 
-  // Delete all devices in the subcollection first
-  const devicesSnap = await sessionRef(id).collection("devices").get();
-  const batch = getFirestore().batch();
-  devicesSnap.docs.forEach((doc) => batch.delete(doc.ref));
-  batch.delete(sessionRef(id));
-  await batch.commit();
+  await sessionRef(id).delete();
 
   console.log(`[session] deleted session=${id}`);
-  res.status(204).send();
-});
-
-// ─── App-facing routes ────────────────────────────────────────────────────────
-
-// POST /sessions/:id/join
-router.post("/:id/join", requireAuth, async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const parse = JoinSchema.safeParse(req.body);
-  if (!parse.success) {
-    res.status(400).json({ error: parse.error.message, code: "VALIDATION_ERROR" });
-    return;
-  }
-
-  const data = await getSessionOrFail(id, res);
-  if (!data) return;
-
-  const { fcmToken, platform } = parse.data;
-  const deviceId = uuidv4();
-  const now = admin.firestore.Timestamp.now();
-
-  await sessionRef(id).collection("devices").doc(deviceId).set({
-    fcmToken,
-    userId: req.uid!,
-    platform,
-    registeredAt: now,
-  });
-
-  console.log(
-    `[device] registered deviceId=${deviceId} userId=${req.uid} platform=${platform} session=${id}`
-  );
-  res.status(201).json({
-    deviceId,
-    session: {
-      sessionId: id,
-      name: data.name,
-      agent: data.agent,
-      status: data.status,
-    },
-  });
-});
-
-// DELETE /sessions/:id/leave
-router.delete("/:id/leave", requireAuth, async (req: Request, res: Response) => {
-  const { id } = req.params;
-
-  const snap = await sessionRef(id).get();
-  if (!snap.exists) {
-    res.status(404).json({ error: "Session not found", code: "NOT_FOUND" });
-    return;
-  }
-
-  // Remove all devices belonging to this user for this session
-  const devicesSnap = await sessionRef(id)
-    .collection("devices")
-    .where("userId", "==", req.uid!)
-    .get();
-
-  if (devicesSnap.empty) {
-    res.status(404).json({ error: "No registered devices found for this user in this session", code: "NOT_FOUND" });
-    return;
-  }
-
-  const batch = getFirestore().batch();
-  devicesSnap.docs.forEach((doc) => batch.delete(doc.ref));
-  await batch.commit();
-
-  console.log(
-    `[device] unregistered userId=${req.uid} from session=${id} (${devicesSnap.size} device(s))`
-  );
   res.status(204).send();
 });
 
