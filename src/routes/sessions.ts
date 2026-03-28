@@ -192,7 +192,15 @@ router.post("/:id/join", requireAuth, async (req: Request, res: Response) => {
   console.log(
     `[device] registered deviceId=${deviceId} userId=${req.uid} platform=${platform} session=${id}`
   );
-  res.status(201).json({ deviceId });
+  res.status(201).json({
+    deviceId,
+    session: {
+      sessionId: id,
+      name: data.name,
+      agent: data.agent,
+      status: data.status,
+    },
+  });
 });
 
 // DELETE /sessions/:id/leave
