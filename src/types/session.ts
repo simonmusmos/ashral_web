@@ -9,10 +9,15 @@ export interface Session {
   sessionId: string;
   agent: string;
   name: string;
-  userId: string | null;
   status: SessionStatus;
   createdAt: FirebaseFirestore.Timestamp;
   expiresAt: FirebaseFirestore.Timestamp;
+}
+
+export interface Member {
+  userId: string;
+  customName: string | null;
+  joinedAt: FirebaseFirestore.Timestamp;
 }
 
 export interface Device {

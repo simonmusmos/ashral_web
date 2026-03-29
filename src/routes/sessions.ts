@@ -33,12 +33,21 @@ const NotifySchema = z.object({
 
 const JoinSchema = z.object({
   userId: z.string().min(1),
+  customName: z.string().optional(),
+});
+
+const UpdateMemberSchema = z.object({
+  customName: z.string().min(1),
 });
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function sessionRef(sessionId: string) {
   return getFirestore().collection("sessions").doc(sessionId);
+}
+
+function membersRef(sessionId: string) {
+  return sessionRef(sessionId).collection("members");
 }
 
 async function getSessionOrFail(
@@ -81,7 +90,6 @@ router.post("/", async (req: Request, res: Response) => {
   await sessionRef(sessionId).set({
     agent,
     name,
-    userId: null,
     status: "active" as SessionStatus,
     createdAt: now,
     expiresAt,
@@ -100,21 +108,69 @@ router.post("/:id/join", async (req: Request, res: Response) => {
     return;
   }
 
-  const data = await getSessionOrFail(id, res);
-  if (!data) return;
+  const sessionData = await getSessionOrFail(id, res);
+  if (!sessionData) return;
 
-  const { userId } = parse.data;
+  const { userId, customName } = parse.data;
   const db = getFirestore();
   const now = admin.firestore.Timestamp.now();
 
   // Create users/{userId} doc if it doesn't exist
-  const userRef = db.collection("users").doc(userId);
-  await userRef.set({ createdAt: now }, { merge: true });
+  await db.collection("users").doc(userId).set({ createdAt: now }, { merge: true });
 
-  // Link the user to the session
-  await sessionRef(id).update({ userId });
+  // Upsert member doc — allows the same user to rejoin and update their customName
+  await membersRef(id).doc(userId).set({
+    userId,
+    customName: customName ?? null,
+    joinedAt: now,
+  }, { merge: true });
 
   console.log(`[session] joined session=${id} userId=${userId}`);
+  res.status(200).json({ ok: true });
+});
+
+// GET /sessions/:id/members/:userId
+router.get("/:id/members/:userId", async (req: Request, res: Response) => {
+  const { id, userId } = req.params;
+
+  const sessionData = await getSessionOrFail(id, res);
+  if (!sessionData) return;
+
+  const memberSnap = await membersRef(id).doc(userId).get();
+  if (!memberSnap.exists) {
+    res.status(404).json({ error: "Member not found", code: "NOT_FOUND" });
+    return;
+  }
+
+  const data = memberSnap.data()!;
+  res.status(200).json({
+    userId: data.userId,
+    customName: data.customName,
+    joinedAt: data.joinedAt,
+  });
+});
+
+// PATCH /sessions/:id/members/:userId
+router.patch("/:id/members/:userId", async (req: Request, res: Response) => {
+  const { id, userId } = req.params;
+  const parse = UpdateMemberSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: parse.error.message, code: "VALIDATION_ERROR" });
+    return;
+  }
+
+  const sessionData = await getSessionOrFail(id, res);
+  if (!sessionData) return;
+
+  const memberSnap = await membersRef(id).doc(userId).get();
+  if (!memberSnap.exists) {
+    res.status(404).json({ error: "Member not found", code: "NOT_FOUND" });
+    return;
+  }
+
+  await membersRef(id).doc(userId).update({ customName: parse.data.customName });
+
+  console.log(`[session] member customName updated session=${id} userId=${userId}`);
   res.status(200).json({ ok: true });
 });
 
@@ -148,14 +204,16 @@ router.post("/:id/notify", async (req: Request, res: Response) => {
   const data = await getSessionOrFail(id, res);
   if (!data) return;
 
-  if (!data.userId) {
-    console.log(`[notify] session=${id} has no linked user — skipping`);
-    res.status(200).json({ skipped: true, reason: "no user linked" });
+  const membersSnap = await membersRef(id).get();
+  if (membersSnap.empty) {
+    console.log(`[notify] session=${id} has no members — skipping`);
+    res.status(200).json({ skipped: true, reason: "no members" });
     return;
   }
 
-  const sent = await sendNotifications(data.userId as string, parse.data);
-  console.log(`[notify] session=${id} userId=${data.userId} sent=${sent}`);
+  const memberIds = membersSnap.docs.map((doc) => doc.id);
+  const sent = await sendNotifications(id, memberIds, parse.data);
+  console.log(`[notify] session=${id} members=${memberIds.length} sent=${sent}`);
   res.status(200).json({ sent });
 });
 
@@ -169,9 +227,14 @@ router.delete("/:id", async (req: Request, res: Response) => {
     return;
   }
 
-  await sessionRef(id).delete();
+  // Delete members subcollection then the session doc
+  const membersSnap = await membersRef(id).get();
+  const batch = getFirestore().batch();
+  membersSnap.docs.forEach((doc) => batch.delete(doc.ref));
+  batch.delete(sessionRef(id));
+  await batch.commit();
 
-  console.log(`[session] deleted session=${id}`);
+  console.log(`[session] deleted session=${id} (${membersSnap.size} member(s) removed)`);
   res.status(204).send();
 });
 
