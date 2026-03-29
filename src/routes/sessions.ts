@@ -42,12 +42,18 @@ const UpdateMemberSchema = z.object({
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+function userSessionId(userId: string, sessionId: string) {
+  return `${userId}_${sessionId}`;
+}
+
 function sessionRef(sessionId: string) {
   return getFirestore().collection("sessions").doc(sessionId);
 }
 
-function membersRef(sessionId: string) {
-  return sessionRef(sessionId).collection("members");
+function userSessionRef(userId: string, sessionId: string) {
+  return getFirestore()
+    .collection("userSessions")
+    .doc(userSessionId(userId, sessionId));
 }
 
 async function getSessionOrFail(
@@ -118,15 +124,22 @@ router.post("/:id/join", async (req: Request, res: Response) => {
   // Create users/{userId} doc if it doesn't exist
   await db.collection("users").doc(userId).set({ createdAt: now }, { merge: true });
 
-  // Upsert member doc — allows the same user to rejoin and update their customName
-  await membersRef(id).doc(userId).set({
-    userId,
-    customName: customName ?? null,
-    joinedAt: now,
-  }, { merge: true });
+  // Upsert pivot row — idempotent, safe to call multiple times
+  await userSessionRef(userId, id).set(
+    { userId, sessionId: id, customName: customName ?? null, joinedAt: now },
+    { merge: true }
+  );
 
   console.log(`[session] joined session=${id} userId=${userId}`);
-  res.status(200).json({ ok: true });
+  res.status(200).json({
+    ok: true,
+    session: {
+      sessionId: id,
+      name: sessionData.name,
+      agent: sessionData.agent,
+      status: sessionData.status,
+    },
+  });
 });
 
 // GET /sessions/:id/members/:userId
@@ -136,13 +149,13 @@ router.get("/:id/members/:userId", async (req: Request, res: Response) => {
   const sessionData = await getSessionOrFail(id, res);
   if (!sessionData) return;
 
-  const memberSnap = await membersRef(id).doc(userId).get();
-  if (!memberSnap.exists) {
+  const snap = await userSessionRef(userId, id).get();
+  if (!snap.exists) {
     res.status(404).json({ error: "Member not found", code: "NOT_FOUND" });
     return;
   }
 
-  const data = memberSnap.data()!;
+  const data = snap.data()!;
   res.status(200).json({
     userId: data.userId,
     customName: data.customName,
@@ -162,15 +175,15 @@ router.patch("/:id/members/:userId", async (req: Request, res: Response) => {
   const sessionData = await getSessionOrFail(id, res);
   if (!sessionData) return;
 
-  const memberSnap = await membersRef(id).doc(userId).get();
-  if (!memberSnap.exists) {
+  const snap = await userSessionRef(userId, id).get();
+  if (!snap.exists) {
     res.status(404).json({ error: "Member not found", code: "NOT_FOUND" });
     return;
   }
 
-  await membersRef(id).doc(userId).update({ customName: parse.data.customName });
+  await userSessionRef(userId, id).update({ customName: parse.data.customName });
 
-  console.log(`[session] member customName updated session=${id} userId=${userId}`);
+  console.log(`[session] customName updated session=${id} userId=${userId}`);
   res.status(200).json({ ok: true });
 });
 
@@ -204,14 +217,18 @@ router.post("/:id/notify", async (req: Request, res: Response) => {
   const data = await getSessionOrFail(id, res);
   if (!data) return;
 
-  const membersSnap = await membersRef(id).get();
+  const membersSnap = await getFirestore()
+    .collection("userSessions")
+    .where("sessionId", "==", id)
+    .get();
+
   if (membersSnap.empty) {
     console.log(`[notify] session=${id} has no members — skipping`);
     res.status(200).json({ skipped: true, reason: "no members" });
     return;
   }
 
-  const memberIds = membersSnap.docs.map((doc) => doc.id);
+  const memberIds = membersSnap.docs.map((doc) => doc.data().userId as string);
   const sent = await sendNotifications(id, memberIds, parse.data);
   console.log(`[notify] session=${id} members=${memberIds.length} sent=${sent}`);
   res.status(200).json({ sent });
@@ -227,14 +244,18 @@ router.delete("/:id", async (req: Request, res: Response) => {
     return;
   }
 
-  // Delete members subcollection then the session doc
-  const membersSnap = await membersRef(id).get();
+  // Delete all pivot rows for this session, then the session doc
+  const membersSnap = await getFirestore()
+    .collection("userSessions")
+    .where("sessionId", "==", id)
+    .get();
+
   const batch = getFirestore().batch();
   membersSnap.docs.forEach((doc) => batch.delete(doc.ref));
   batch.delete(sessionRef(id));
   await batch.commit();
 
-  console.log(`[session] deleted session=${id} (${membersSnap.size} member(s) removed)`);
+  console.log(`[session] deleted session=${id} (${membersSnap.size} pivot row(s) removed)`);
   res.status(204).send();
 });
 

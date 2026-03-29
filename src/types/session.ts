@@ -14,8 +14,9 @@ export interface Session {
   expiresAt: FirebaseFirestore.Timestamp;
 }
 
-export interface Member {
+export interface UserSession {
   userId: string;
+  sessionId: string;
   customName: string | null;
   joinedAt: FirebaseFirestore.Timestamp;
 }

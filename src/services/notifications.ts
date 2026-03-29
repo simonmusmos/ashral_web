@@ -47,14 +47,13 @@ export async function sendNotifications(
   const db = getFirestore();
   const messaging = getMessaging();
 
-  // Collect all device docs across all members in parallel
+  // Fetch all device subcollections for every member in parallel
   const deviceSnapshots = await Promise.all(
     memberIds.map((userId) =>
       db.collection("users").doc(userId).collection("devices").get()
     )
   );
 
-  // Flatten into { userId, doc } pairs so we can log context on failure
   const allDevices = deviceSnapshots.flatMap((snap, i) =>
     snap.docs.map((doc) => ({ userId: memberIds[i], doc }))
   );
@@ -71,9 +70,7 @@ export async function sendNotifications(
       } catch (err: unknown) {
         const fcmErr = err as admin.FirebaseError;
         if (INVALID_TOKEN_CODES.has(fcmErr.code ?? "")) {
-          console.warn(
-            `[notify] stale token device=${doc.id} user=${userId} — removing`
-          );
+          console.warn(`[notify] stale token device=${doc.id} user=${userId} — removing`);
           await doc.ref.delete();
         } else {
           console.error(
