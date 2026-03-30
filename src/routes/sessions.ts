@@ -4,6 +4,7 @@ import * as admin from "firebase-admin";
 import { z } from "zod";
 import { getFirestore } from "../services/firebase";
 import { sendNotifications } from "../services/notifications";
+import { extractNotificationBody } from "../services/openai";
 import { SessionStatus } from "../types/session";
 
 const router = Router();
@@ -29,6 +30,7 @@ const NotifySchema = z.object({
   title: z.string().min(1),
   body: z.string().min(1),
   priority: z.enum(["high", "normal"]).default("high"),
+  rawText: z.string().max(1000).optional(),
 });
 
 const JoinSchema = z.object({
@@ -265,7 +267,15 @@ router.post("/:id/notify", async (req: Request, res: Response) => {
     userId: doc.data().userId as string,
     customName: doc.data().customName as string | null,
   }));
-  const sent = await sendNotifications(id, members, parse.data);
+
+  const { rawText, ...basePayload } = parse.data;
+  let notifyBody = basePayload.body;
+  if (rawText) {
+    const extracted = await extractNotificationBody(rawText);
+    if (extracted) notifyBody = extracted;
+  }
+
+  const sent = await sendNotifications(id, members, { ...basePayload, body: notifyBody });
   console.log(`[notify] session=${id} members=${members.length} sent=${sent}`);
   res.status(200).json({ sent });
 });
