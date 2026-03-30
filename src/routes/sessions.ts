@@ -76,10 +76,43 @@ async function getSessionOrFail(
   return data;
 }
 
+// ─── Semver helpers ──────────────────────────────────────────────────────────
+
+function parseSemver(v: string): [number, number, number] | null {
+  const parts = v.trim().replace(/^v/, "").split(".");
+  if (parts.length !== 3) return null;
+  const nums = parts.map(Number);
+  if (nums.some(isNaN)) return null;
+  return nums as [number, number, number];
+}
+
+// Returns true if `a` is strictly less than `b`
+function semverLt(a: [number, number, number], b: [number, number, number]): boolean {
+  for (let i = 0; i < 3; i++) {
+    if (a[i] < b[i]) return true;
+    if (a[i] > b[i]) return false;
+  }
+  return false;
+}
+
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 // POST /sessions
 router.post("/", async (req: Request, res: Response) => {
+  const clientVersion = req.headers["x-ashral-version"] as string | undefined;
+  const minVersion = process.env.MIN_CLI_VERSION;
+
+  if (clientVersion && minVersion) {
+    const client = parseSemver(clientVersion);
+    const min = parseSemver(minVersion);
+    if (client && min && semverLt(client, min)) {
+      res.status(426).json({
+        error: `Client version ${clientVersion} is no longer supported. Please run: npm install -g ashral`,
+      });
+      return;
+    }
+  }
+
   const parse = CreateSessionSchema.safeParse(req.body);
   if (!parse.success) {
     res.status(400).json({ error: parse.error.message, code: "VALIDATION_ERROR" });
