@@ -13,11 +13,11 @@ const INVALID_TOKEN_CODES = new Set([
   "messaging/registration-token-not-registered",
 ]);
 
-function buildMessage(token: string, payload: NotifyPayload): admin.messaging.Message {
+function buildMessage(token: string, payload: NotifyPayload, title: string): admin.messaging.Message {
   return {
     token,
     notification: {
-      title: payload.title,
+      title,
       body: payload.body,
     },
     android: {
@@ -39,32 +39,33 @@ function buildMessage(token: string, payload: NotifyPayload): admin.messaging.Me
 
 export async function sendNotifications(
   sessionId: string,
-  memberIds: string[],
+  members: { userId: string; customName: string | null }[],
   payload: NotifyPayload
 ): Promise<number> {
-  if (memberIds.length === 0) return 0;
+  if (members.length === 0) return 0;
 
   const db = getFirestore();
   const messaging = getMessaging();
 
   // Fetch all device subcollections for every member in parallel
   const deviceSnapshots = await Promise.all(
-    memberIds.map((userId) =>
+    members.map(({ userId }) =>
       db.collection("users").doc(userId).collection("devices").get()
     )
   );
 
   const allDevices = deviceSnapshots.flatMap((snap, i) =>
-    snap.docs.map((doc) => ({ userId: memberIds[i], doc }))
+    snap.docs.map((doc) => ({ userId: members[i].userId, customName: members[i].customName, doc }))
   );
 
   if (allDevices.length === 0) return 0;
 
   const results = await Promise.allSettled(
-    allDevices.map(async ({ userId, doc }) => {
+    allDevices.map(async ({ userId, customName, doc }) => {
       const { fcmToken } = doc.data() as { fcmToken: string };
+      const title = customName ?? payload.title;
       try {
-        await messaging.send(buildMessage(fcmToken, payload));
+        await messaging.send(buildMessage(fcmToken, payload, title));
         console.log(`[notify] sent session=${sessionId} device=${doc.id} user=${userId}`);
         return true;
       } catch (err: unknown) {

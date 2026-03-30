@@ -261,9 +261,12 @@ router.post("/:id/notify", async (req: Request, res: Response) => {
     return;
   }
 
-  const memberIds = membersSnap.docs.map((doc) => doc.data().userId as string);
-  const sent = await sendNotifications(id, memberIds, parse.data);
-  console.log(`[notify] session=${id} members=${memberIds.length} sent=${sent}`);
+  const members = membersSnap.docs.map((doc) => ({
+    userId: doc.data().userId as string,
+    customName: doc.data().customName as string | null,
+  }));
+  const sent = await sendNotifications(id, members, parse.data);
+  console.log(`[notify] session=${id} members=${members.length} sent=${sent}`);
   res.status(200).json({ sent });
 });
 
