@@ -42,6 +42,15 @@ const UpdateMemberSchema = z.object({
   customName: z.string().min(1),
 });
 
+const AppendOutputSchema = z.object({
+  text: z.string().min(1).max(16000),
+  stream: z.enum(["stdout", "stderr"]).default("stdout"),
+});
+
+const GetOutputQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(1000).default(200),
+});
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function userSessionId(userId: string, sessionId: string) {
@@ -56,6 +65,10 @@ function userSessionRef(userId: string, sessionId: string) {
   return getFirestore()
     .collection("userSessions")
     .doc(userSessionId(userId, sessionId));
+}
+
+function outputRef(sessionId: string) {
+  return sessionRef(sessionId).collection("output");
 }
 
 async function getSessionOrFail(
@@ -240,6 +253,70 @@ router.patch("/:id/status", async (req: Request, res: Response) => {
   res.status(200).json({ ok: true });
 });
 
+// POST /sessions/:id/output
+router.post("/:id/output", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const parse = AppendOutputSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: parse.error.message, code: "VALIDATION_ERROR" });
+    return;
+  }
+
+  const data = await getSessionOrFail(id, res);
+  if (!data) return;
+
+  const chunkId = uuidv4();
+  const createdAt = admin.firestore.Timestamp.now();
+  const { text, stream } = parse.data;
+
+  const batch = getFirestore().batch();
+  batch.set(outputRef(id).doc(chunkId), {
+    text,
+    stream,
+    createdAt,
+  });
+  batch.update(sessionRef(id), {
+    lastOutputAt: createdAt,
+    outputChunkCount: admin.firestore.FieldValue.increment(1),
+  });
+  await batch.commit();
+
+  console.log(
+    `[output] appended session=${id} chunk=${chunkId} stream=${stream} chars=${text.length}`
+  );
+  res.status(201).json({ ok: true, chunkId, createdAt });
+});
+
+// GET /sessions/:id/output
+router.get("/:id/output", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const parse = GetOutputQuerySchema.safeParse(req.query);
+  if (!parse.success) {
+    res.status(400).json({ error: parse.error.message, code: "VALIDATION_ERROR" });
+    return;
+  }
+
+  const data = await getSessionOrFail(id, res);
+  if (!data) return;
+
+  const chunksSnap = await outputRef(id)
+    .orderBy("createdAt", "asc")
+    .limit(parse.data.limit)
+    .get();
+
+  const chunks = chunksSnap.docs.map((doc) => {
+    const chunk = doc.data();
+    return {
+      chunkId: doc.id,
+      text: chunk.text,
+      stream: chunk.stream,
+      createdAt: chunk.createdAt,
+    };
+  });
+
+  res.status(200).json({ chunks });
+});
+
 // POST /sessions/:id/notify
 router.post("/:id/notify", async (req: Request, res: Response) => {
   const { id } = req.params;
@@ -295,13 +372,17 @@ router.delete("/:id", async (req: Request, res: Response) => {
     .collection("userSessions")
     .where("sessionId", "==", id)
     .get();
+  const outputSnap = await outputRef(id).get();
 
   const batch = getFirestore().batch();
   membersSnap.docs.forEach((doc) => batch.delete(doc.ref));
+  outputSnap.docs.forEach((doc) => batch.delete(doc.ref));
   batch.delete(sessionRef(id));
   await batch.commit();
 
-  console.log(`[session] deleted session=${id} (${membersSnap.size} pivot row(s) removed)`);
+  console.log(
+    `[session] deleted session=${id} (${membersSnap.size} pivot row(s), ${outputSnap.size} output chunk(s) removed)`
+  );
   res.status(204).send();
 });
 

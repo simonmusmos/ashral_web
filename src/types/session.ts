@@ -12,6 +12,8 @@ export interface Session {
   status: SessionStatus;
   createdAt: FirebaseFirestore.Timestamp;
   expiresAt: FirebaseFirestore.Timestamp;
+  lastOutputAt?: FirebaseFirestore.Timestamp;
+  outputChunkCount?: number;
 }
 
 export interface UserSession {
@@ -24,5 +26,12 @@ export interface UserSession {
 export interface Device {
   deviceId: string;
   fcmToken: string;
+  createdAt: FirebaseFirestore.Timestamp;
+}
+
+export interface TerminalOutputChunk {
+  chunkId: string;
+  text: string;
+  stream: "stdout" | "stderr";
   createdAt: FirebaseFirestore.Timestamp;
 }
