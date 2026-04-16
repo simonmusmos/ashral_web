@@ -16,6 +16,11 @@ const CreateSessionSchema = z.object({
   name: z.string().min(1),
 });
 
+const PendingActionSchema = z.object({
+  question: z.string().optional(),
+  options: z.array(z.string()).min(1),
+});
+
 const UpdateStatusSchema = z.object({
   status: z.enum([
     "active",
@@ -24,6 +29,7 @@ const UpdateStatusSchema = z.object({
     "completed",
     "error",
   ] as [SessionStatus, ...SessionStatus[]]),
+  pendingAction: PendingActionSchema.optional(),
 });
 
 const NotifySchema = z.object({
@@ -31,6 +37,11 @@ const NotifySchema = z.object({
   body: z.string().min(1),
   priority: z.enum(["high", "normal"]).default("high"),
   rawText: z.string().max(1000).optional(),
+});
+
+const RespondSchema = z.object({
+  userId: z.string().min(1),
+  action: z.string().min(1),
 });
 
 const JoinSchema = z.object({
@@ -45,6 +56,10 @@ const UpdateMemberSchema = z.object({
 const AppendOutputSchema = z.object({
   text: z.string().min(1).max(16000),
   stream: z.enum(["stdout", "stderr"]).default("stdout"),
+});
+
+const CompleteSessionSchema = z.object({
+  output: z.string().max(100_000).optional(),
 });
 
 const GetOutputQuerySchema = z.object({
@@ -247,9 +262,20 @@ router.patch("/:id/status", async (req: Request, res: Response) => {
   const data = await getSessionOrFail(id, res);
   if (!data) return;
 
-  await sessionRef(id).update({ status: parse.data.status });
+  const { status, pendingAction } = parse.data;
+  const update: Record<string, unknown> = { status };
 
-  console.log(`[session] status updated session=${id} status=${parse.data.status}`);
+  if (pendingAction) {
+    update.pendingAction = pendingAction;
+  } else if (status === "running") {
+    // Clear pending state when agent resumes
+    update.pendingAction = admin.firestore.FieldValue.delete();
+    update.pendingResponse = admin.firestore.FieldValue.delete();
+  }
+
+  await sessionRef(id).update(update);
+
+  console.log(`[session] status updated session=${id} status=${status}`);
   res.status(200).json({ ok: true });
 });
 
@@ -355,6 +381,96 @@ router.post("/:id/notify", async (req: Request, res: Response) => {
   const sent = await sendNotifications(id, members, { ...basePayload, body: notifyBody });
   console.log(`[notify] session=${id} members=${members.length} sent=${sent}`);
   res.status(200).json({ sent });
+});
+
+// PATCH /sessions/:id/complete
+router.patch("/:id/complete", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const parse = CompleteSessionSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: parse.error.message, code: "VALIDATION_ERROR" });
+    return;
+  }
+
+  const snap = await sessionRef(id).get();
+  if (!snap.exists) {
+    res.status(404).json({ error: "Session not found", code: "NOT_FOUND" });
+    return;
+  }
+
+  const update: Record<string, unknown> = {
+    status: "completed" as SessionStatus,
+    completedAt: admin.firestore.Timestamp.now(),
+  };
+  if (parse.data.output) {
+    update.finalOutput = parse.data.output;
+  }
+
+  await sessionRef(id).update(update);
+  console.log(`[session] completed session=${id} outputChars=${parse.data.output?.length ?? 0}`);
+  res.status(200).json({ ok: true });
+});
+
+// GET /sessions/:id
+router.get("/:id", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const data = await getSessionOrFail(id, res);
+  if (!data) return;
+
+  res.status(200).json({
+    sessionId: id,
+    name: data.name,
+    agent: data.agent,
+    status: data.status,
+    createdAt: data.createdAt,
+    pendingAction: data.pendingAction ?? null,
+  });
+});
+
+// POST /sessions/:id/respond — mobile app submits a choice
+router.post("/:id/respond", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const parse = RespondSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: parse.error.message, code: "VALIDATION_ERROR" });
+    return;
+  }
+
+  const data = await getSessionOrFail(id, res);
+  if (!data) return;
+
+  const now = admin.firestore.Timestamp.now();
+  await sessionRef(id).update({
+    pendingResponse: { action: parse.data.action, respondedAt: now },
+    pendingAction: admin.firestore.FieldValue.delete(),
+  });
+
+  console.log(`[session] respond session=${id} userId=${parse.data.userId} action="${parse.data.action}"`);
+  res.status(200).json({ ok: true });
+});
+
+// GET /sessions/:id/response — CLI polls for a pending response (one-time read)
+router.get("/:id/response", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const snap = await sessionRef(id).get();
+  if (!snap.exists) {
+    res.status(404).json({ error: "Session not found", code: "NOT_FOUND" });
+    return;
+  }
+
+  const pending = snap.data()?.pendingResponse;
+  if (!pending) {
+    res.status(200).json({ response: null });
+    return;
+  }
+
+  // Consume and clear the response atomically
+  await sessionRef(id).update({
+    pendingResponse: admin.firestore.FieldValue.delete(),
+  });
+
+  console.log(`[session] response consumed session=${id} action="${pending.action}"`);
+  res.status(200).json({ response: pending.action as string });
 });
 
 // DELETE /sessions/:id
