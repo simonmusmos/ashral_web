@@ -268,7 +268,8 @@ router.patch("/:id/status", async (req: Request, res: Response) => {
   if (pendingAction) {
     update.pendingAction = pendingAction;
   } else if (status === "running") {
-    // Only clear pendingResponse — pendingAction is cleared by POST /respond when user replies
+    // Clear pending state when agent resumes
+    update.pendingAction = admin.firestore.FieldValue.delete();
     update.pendingResponse = admin.firestore.FieldValue.delete();
   }
 
