@@ -466,6 +466,7 @@ router.get("/:id/response", async (req: Request, res: Response) => {
   // Consume and clear the response atomically
   await sessionRef(id).update({
     pendingResponse: admin.firestore.FieldValue.delete(),
+    pendingAction: admin.firestore.FieldValue.delete(),
   });
 
   console.log(`[session] response consumed session=${id} action="${pending.action}"`);
