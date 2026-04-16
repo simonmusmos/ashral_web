@@ -18,7 +18,7 @@ const CreateSessionSchema = z.object({
 
 const PendingActionSchema = z.object({
   question: z.string().optional(),
-  options: z.array(z.string()).min(1),
+  options: z.array(z.string()),
 });
 
 const UpdateStatusSchema = z.object({
@@ -275,7 +275,7 @@ router.patch("/:id/status", async (req: Request, res: Response) => {
 
   await sessionRef(id).update(update);
 
-  console.log(`[session] status updated session=${id} status=${status}`);
+  console.log(`[session] status updated session=${id} status=${status} pendingAction=${JSON.stringify(pendingAction ?? null)}`);
   res.status(200).json({ ok: true });
 });
 
