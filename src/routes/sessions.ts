@@ -62,6 +62,7 @@ const UpdateStatsSchema = z.object({
   calls: z.number().int().min(0).optional(),
   tokens: z.number().int().min(0).optional(),
   files: z.number().int().min(0).optional(),
+  cost: z.number().min(0).optional(),
 });
 
 const CompleteSessionSchema = z.object({
@@ -432,6 +433,7 @@ router.patch("/:id/stats", async (req: Request, res: Response) => {
   if (parse.data.calls)  updates["stats.calls"]  = admin.firestore.FieldValue.increment(parse.data.calls);
   if (parse.data.tokens) updates["stats.tokens"] = admin.firestore.FieldValue.increment(parse.data.tokens);
   if (parse.data.files)  updates["stats.files"]  = admin.firestore.FieldValue.increment(parse.data.files);
+  if (parse.data.cost)   updates["stats.cost"]   = admin.firestore.FieldValue.increment(parse.data.cost);
   if (Object.keys(updates).length > 0) await sessionRef(id).update(updates);
 
   res.status(200).json({ ok: true });
