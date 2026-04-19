@@ -58,6 +58,12 @@ const AppendOutputSchema = z.object({
   stream: z.enum(["stdout", "stderr"]).default("stdout"),
 });
 
+const UpdateStatsSchema = z.object({
+  calls: z.number().int().min(0).optional(),
+  tokens: z.number().int().min(0).optional(),
+  files: z.number().int().min(0).optional(),
+});
+
 const CompleteSessionSchema = z.object({
   output: z.string().max(100_000).optional(),
 });
@@ -411,6 +417,26 @@ router.patch("/:id/complete", async (req: Request, res: Response) => {
   res.status(200).json({ ok: true });
 });
 
+// PATCH /sessions/:id/stats — CLI increments usage counters
+router.patch("/:id/stats", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const parse = UpdateStatsSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: parse.error.message });
+    return;
+  }
+  const snap = await sessionRef(id).get();
+  if (!snap.exists) { res.status(404).json({ error: "Session not found" }); return; }
+
+  const updates: Record<string, admin.firestore.FieldValue> = {};
+  if (parse.data.calls)  updates["stats.calls"]  = admin.firestore.FieldValue.increment(parse.data.calls);
+  if (parse.data.tokens) updates["stats.tokens"] = admin.firestore.FieldValue.increment(parse.data.tokens);
+  if (parse.data.files)  updates["stats.files"]  = admin.firestore.FieldValue.increment(parse.data.files);
+  if (Object.keys(updates).length > 0) await sessionRef(id).update(updates);
+
+  res.status(200).json({ ok: true });
+});
+
 // GET /sessions/:id
 router.get("/:id", async (req: Request, res: Response) => {
   const { id } = req.params;
@@ -424,6 +450,7 @@ router.get("/:id", async (req: Request, res: Response) => {
     status: data.status,
     createdAt: data.createdAt,
     pendingAction: data.pendingAction ?? null,
+    stats: data.stats ?? null,
   });
 });
 
