@@ -3,7 +3,8 @@ export type SessionStatus =
   | "waiting_for_input"
   | "running"
   | "completed"
-  | "error";
+  | "error"
+  | "terminated";
 
 export interface Session {
   sessionId: string;

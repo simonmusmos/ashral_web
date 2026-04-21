@@ -28,6 +28,7 @@ const UpdateStatusSchema = z.object({
     "running",
     "completed",
     "error",
+    "terminated",
   ] as [SessionStatus, ...SessionStatus[]]),
   pendingAction: PendingActionSchema.optional(),
 });
