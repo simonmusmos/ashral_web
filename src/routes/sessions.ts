@@ -45,6 +45,10 @@ const RespondSchema = z.object({
   action: z.string().min(1),
 });
 
+const AgentSessionSchema = z.object({
+  agentSessionId: z.string().min(1),
+});
+
 const JoinSchema = z.object({
   userId: z.string().min(1),
   customName: z.string().optional(),
@@ -454,7 +458,25 @@ router.get("/:id", async (req: Request, res: Response) => {
     createdAt: data.createdAt,
     pendingAction: data.pendingAction ?? null,
     stats: data.stats ?? null,
+    agentSessionId: data.agentSessionId ?? null,
   });
+});
+
+// PATCH /sessions/:id/agent-session
+router.patch("/:id/agent-session", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const parse = AgentSessionSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: parse.error.message, code: "VALIDATION_ERROR" });
+    return;
+  }
+
+  const data = await getSessionOrFail(id, res);
+  if (!data) return;
+
+  await sessionRef(id).update({ agentSessionId: parse.data.agentSessionId });
+  console.log(`[session] agentSessionId saved session=${id}`);
+  res.status(200).json({ ok: true });
 });
 
 // POST /sessions/:id/respond — mobile app submits a choice
