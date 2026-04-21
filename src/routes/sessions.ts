@@ -163,6 +163,7 @@ router.post("/", async (req: Request, res: Response) => {
 
   const { agent, name } = parse.data;
   const sessionId = uuidv4();
+  const shortId = sessionId.replace(/-/g, '').slice(0, 8);
   const now = admin.firestore.Timestamp.now();
   const expiresAt = admin.firestore.Timestamp.fromDate(
     new Date(Date.now() + 24 * 60 * 60 * 1000)
@@ -171,6 +172,7 @@ router.post("/", async (req: Request, res: Response) => {
   await sessionRef(sessionId).set({
     agent,
     name,
+    shortId,
     status: "active" as SessionStatus,
     createdAt: now,
     expiresAt,
@@ -468,6 +470,24 @@ router.patch("/:id/stats", async (req: Request, res: Response) => {
   res.status(200).json({ ok: true });
 });
 
+// GET /sessions/short/:shortId — resolve an 8-char short ID to full session
+router.get("/short/:shortId", async (req: Request, res: Response) => {
+  const { shortId } = req.params;
+  const snap = await getFirestore()
+    .collection("sessions")
+    .where("shortId", "==", shortId)
+    .limit(1)
+    .get();
+
+  if (snap.empty) {
+    res.status(404).json({ error: "Session not found", code: "NOT_FOUND" });
+    return;
+  }
+
+  const doc = snap.docs[0];
+  res.status(200).json({ sessionId: doc.id });
+});
+
 // GET /sessions/:id
 router.get("/:id", async (req: Request, res: Response) => {
   const { id } = req.params;
@@ -483,6 +503,7 @@ router.get("/:id", async (req: Request, res: Response) => {
     pendingAction: data.pendingAction ?? null,
     stats: data.stats ?? null,
     agentSessionId: data.agentSessionId ?? null,
+    shortId: data.shortId ?? null,
   });
 });
 
