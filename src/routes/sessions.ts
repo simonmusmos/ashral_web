@@ -395,6 +395,30 @@ router.post("/:id/notify", async (req: Request, res: Response) => {
   res.status(200).json({ sent });
 });
 
+// POST /sessions/:id/reactivate — resume command re-opens a terminated session
+router.post("/:id/reactivate", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const snap = await sessionRef(id).get();
+  if (!snap.exists) {
+    res.status(404).json({ error: "Session not found", code: "NOT_FOUND" });
+    return;
+  }
+
+  const expiresAt = admin.firestore.Timestamp.fromDate(
+    new Date(Date.now() + 24 * 60 * 60 * 1000)
+  );
+
+  await sessionRef(id).update({
+    status: "active" as SessionStatus,
+    expiresAt,
+    pendingAction: admin.firestore.FieldValue.delete(),
+    pendingResponse: admin.firestore.FieldValue.delete(),
+  });
+
+  console.log(`[session] reactivated session=${id}`);
+  res.status(200).json({ ok: true });
+});
+
 // PATCH /sessions/:id/complete
 router.patch("/:id/complete", async (req: Request, res: Response) => {
   const { id } = req.params;
