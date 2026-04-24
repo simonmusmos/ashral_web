@@ -282,9 +282,10 @@ router.patch("/:id/status", async (req: Request, res: Response) => {
   if (pendingAction) {
     update.pendingAction = pendingAction;
   } else if (status === "running") {
-    // Clear pending state when agent resumes
     update.pendingAction = admin.firestore.FieldValue.delete();
-    update.pendingResponse = admin.firestore.FieldValue.delete();
+    // pendingResponse is NOT cleared here — it is only consumed by GET /response.
+    // Clearing it here races with the mobile app sending a new message immediately
+    // after the CLI picks up the previous one.
   }
 
   await sessionRef(id).update(update);
