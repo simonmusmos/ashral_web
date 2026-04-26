@@ -572,6 +572,19 @@ router.get("/:id/response", async (req: Request, res: Response) => {
   res.status(200).json({ response: pending.action as string });
 });
 
+// DELETE /sessions/:id/leave — removes only this user's membership (pivot row)
+router.delete("/:id/leave", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { userId } = req.body as { userId?: string };
+  if (!userId) {
+    res.status(400).json({ error: "userId required", code: "VALIDATION_ERROR" });
+    return;
+  }
+  await userSessionRef(userId, id).delete();
+  console.log(`[session] user left session=${id} userId=${userId}`);
+  res.status(200).json({ ok: true });
+});
+
 // DELETE /sessions/:id
 router.delete("/:id", async (req: Request, res: Response) => {
   const { id } = req.params;
