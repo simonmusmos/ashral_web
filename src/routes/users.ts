@@ -46,7 +46,7 @@ router.get("/:userId/sessions", async (req: Request, res: Response) => {
     .map((pivotDoc, i) => {
       const pivot = pivotDoc.data();
       const sessionSnap = sessionSnaps[i];
-      if (!sessionSnap.exists) return null; // session deleted or expired
+      if (!sessionSnap.exists) return null; // session deleted
       const session = sessionSnap.data()!;
       return {
         sessionId: pivot.sessionId,

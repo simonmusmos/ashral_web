@@ -107,15 +107,7 @@ async function getSessionOrFail(
     res.status(404).json({ error: "Session not found", code: "NOT_FOUND" });
     return null;
   }
-
-  const data = snap.data()!;
-  const now = admin.firestore.Timestamp.now();
-  if (data.expiresAt && data.expiresAt < now) {
-    res.status(404).json({ error: "Session has expired", code: "SESSION_EXPIRED" });
-    return null;
-  }
-
-  return data;
+  return snap.data()!;
 }
 
 // ─── Semver helpers ──────────────────────────────────────────────────────────
@@ -165,9 +157,6 @@ router.post("/", async (req: Request, res: Response) => {
   const sessionId = uuidv4();
   const shortId = sessionId.replace(/-/g, '').slice(0, 8);
   const now = admin.firestore.Timestamp.now();
-  const expiresAt = admin.firestore.Timestamp.fromDate(
-    new Date(Date.now() + 24 * 60 * 60 * 1000)
-  );
 
   await sessionRef(sessionId).set({
     agent,
@@ -175,7 +164,6 @@ router.post("/", async (req: Request, res: Response) => {
     shortId,
     status: "active" as SessionStatus,
     createdAt: now,
-    expiresAt,
   });
 
   console.log(`[session] created session=${sessionId} agent=${agent} name="${name}"`);
@@ -407,13 +395,8 @@ router.post("/:id/reactivate", async (req: Request, res: Response) => {
     return;
   }
 
-  const expiresAt = admin.firestore.Timestamp.fromDate(
-    new Date(Date.now() + 24 * 60 * 60 * 1000)
-  );
-
   await sessionRef(id).update({
     status: "active" as SessionStatus,
-    expiresAt,
     pendingAction: admin.firestore.FieldValue.delete(),
     pendingResponse: admin.firestore.FieldValue.delete(),
   });
