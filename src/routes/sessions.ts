@@ -78,6 +78,14 @@ const GetOutputQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(1000).default(200),
 });
 
+const AppendDiffSchema = z.object({
+  toolUseId: z.string().min(1),
+  path: z.string().min(1),
+  type: z.enum(['str_replace', 'write_file', 'create_file']),
+  oldStr: z.string().max(6000).optional(),
+  newStr: z.string().max(6000),
+});
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function userSessionId(userId: string, sessionId: string) {
@@ -595,6 +603,55 @@ router.delete("/:id", async (req: Request, res: Response) => {
     `[session] deleted session=${id} (${membersSnap.size} pivot row(s), ${outputSnap.size} output chunk(s) removed)`
   );
   res.status(204).send();
+});
+
+// POST /sessions/:id/diffs — CLI posts a file diff (tool_use block)
+router.post("/:id/diffs", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const parse = AppendDiffSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: parse.error.message });
+    return;
+  }
+  const snap = await sessionRef(id).get();
+  if (!snap.exists) {
+    res.status(404).json({ error: "Session not found" });
+    return;
+  }
+  const { toolUseId, ...rest } = parse.data;
+  // toolUseId is the doc ID — natural dedup: same tool call = same doc
+  await sessionRef(id).collection('fileDiffs').doc(toolUseId).set({
+    toolUseId,
+    ...rest,
+    createdAt: admin.firestore.Timestamp.now(),
+  });
+  res.status(201).json({ ok: true });
+});
+
+// GET /sessions/:id/diffs — mobile fetches all file diffs for a session
+router.get("/:id/diffs", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const snap = await sessionRef(id).get();
+  if (!snap.exists) {
+    res.status(404).json({ error: "Session not found" });
+    return;
+  }
+  const diffsSnap = await sessionRef(id)
+    .collection('fileDiffs')
+    .orderBy('createdAt', 'asc')
+    .get();
+  const diffs = diffsSnap.docs.map((doc) => {
+    const d = doc.data();
+    return {
+      toolUseId: d.toolUseId as string,
+      path: d.path as string,
+      type: d.type as string,
+      oldStr: (d.oldStr as string | undefined) ?? null,
+      newStr: d.newStr as string,
+      createdAt: d.createdAt,
+    };
+  });
+  res.status(200).json({ diffs });
 });
 
 export default router;
