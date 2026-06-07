@@ -84,6 +84,7 @@ const AppendDiffSchema = z.object({
   type: z.enum(['str_replace', 'write_file', 'create_file']),
   oldStr: z.string().max(6000).optional(),
   newStr: z.string().max(6000),
+  startLine: z.number().int().min(1).optional(),
 });
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -648,6 +649,7 @@ router.get("/:id/diffs", async (req: Request, res: Response) => {
       type: d.type as string,
       oldStr: (d.oldStr as string | undefined) ?? null,
       newStr: d.newStr as string,
+      startLine: (d.startLine as number | undefined) ?? null,
       createdAt: d.createdAt,
     };
   });
