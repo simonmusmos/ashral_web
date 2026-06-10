@@ -25,7 +25,8 @@ function initFirebase(): admin.app.App {
     credential = admin.credential.cert(serviceAccount);
   }
 
-  return admin.initializeApp({ credential });
+  const storageBucket = process.env.FIREBASE_STORAGE_BUCKET;
+  return admin.initializeApp({ credential, storageBucket });
 }
 
 export function getFirebaseApp(): admin.app.App {
@@ -45,4 +46,11 @@ export function getMessaging(): admin.messaging.Messaging {
 
 export function getAuth(): admin.auth.Auth {
   return getFirebaseApp().auth();
+}
+
+export function getStorageBucket(): ReturnType<admin.storage.Storage["bucket"]> {
+  if (!process.env.FIREBASE_STORAGE_BUCKET) {
+    throw new Error("FIREBASE_STORAGE_BUCKET environment variable is not set");
+  }
+  return getFirebaseApp().storage().bucket();
 }

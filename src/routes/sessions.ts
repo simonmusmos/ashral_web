@@ -2,10 +2,22 @@ import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import * as admin from "firebase-admin";
 import { z } from "zod";
-import { getFirestore } from "../services/firebase";
+import multer from "multer";
+import { getFirestore, getStorageBucket } from "../services/firebase";
 import { sendNotifications } from "../services/notifications";
 import { extractNotificationBody } from "../services/openai";
 import { SessionStatus } from "../types/session";
+
+const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/heic"]);
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_IMAGE_BYTES },
+  fileFilter: (_req, file, cb) => {
+    cb(null, IMAGE_MIME_TYPES.has(file.mimetype));
+  },
+});
 
 const router = Router();
 
@@ -539,6 +551,42 @@ router.post("/:id/respond", async (req: Request, res: Response) => {
   res.status(200).json({ ok: true });
 });
 
+// POST /sessions/:id/respond-image — mobile app uploads an image
+router.post("/:id/respond-image", upload.single("image"), async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const userId = (req.body as { userId?: string }).userId;
+  if (!userId) {
+    res.status(400).json({ error: "userId is required", code: "VALIDATION_ERROR" });
+    return;
+  }
+  if (!req.file) {
+    res.status(400).json({ error: "image file is required (field 'image', max 5MB, jpeg/png/webp/heic)", code: "VALIDATION_ERROR" });
+    return;
+  }
+
+  const data = await getSessionOrFail(id, res);
+  if (!data) return;
+
+  const ext = (req.file.originalname.split(".").pop() || "jpg").toLowerCase();
+  const objectPath = `sessions/${id}/uploads/${uuidv4()}.${ext}`;
+  const file = getStorageBucket().file(objectPath);
+  await file.save(req.file.buffer, { contentType: req.file.mimetype });
+
+  const [url] = await file.getSignedUrl({
+    action: "read",
+    expires: Date.now() + 24 * 60 * 60 * 1000,
+  });
+
+  const now = admin.firestore.Timestamp.now();
+  await sessionRef(id).update({
+    pendingResponse: { type: "image", action: url, respondedAt: now },
+    pendingAction: admin.firestore.FieldValue.delete(),
+  });
+
+  console.log(`[session] respond-image session=${id} userId=${userId} path=${objectPath}`);
+  res.status(200).json({ ok: true });
+});
+
 // GET /sessions/:id/response — CLI polls for a pending response (one-time read)
 router.get("/:id/response", async (req: Request, res: Response) => {
   const { id } = req.params;
@@ -561,7 +609,7 @@ router.get("/:id/response", async (req: Request, res: Response) => {
   });
 
   console.log(`[session] response consumed session=${id} action="${pending.action}"`);
-  res.status(200).json({ response: pending.action as string });
+  res.status(200).json({ response: pending.action as string, type: (pending.type as string) ?? "text" });
 });
 
 // DELETE /sessions/:id/leave — removes only this user's membership (pivot row)
