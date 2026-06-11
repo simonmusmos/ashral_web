@@ -1,4 +1,4 @@
-import { Router, Request, Response } from "express";
+import { Router, Request, Response, NextFunction } from "express";
 import { v4 as uuidv4 } from "uuid";
 import * as admin from "firebase-admin";
 import { z } from "zod";
@@ -8,8 +8,8 @@ import { sendNotifications } from "../services/notifications";
 import { extractNotificationBody } from "../services/openai";
 import { SessionStatus } from "../types/session";
 
-const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/heic"]);
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"]);
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -552,7 +552,22 @@ router.post("/:id/respond", async (req: Request, res: Response) => {
 });
 
 // POST /sessions/:id/respond-image — mobile app uploads an image
-router.post("/:id/respond-image", upload.single("image"), async (req: Request, res: Response) => {
+router.post("/:id/respond-image", (req: Request, res: Response, next: NextFunction) => {
+  upload.single("image")(req, res, (err: unknown) => {
+    if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
+      res.status(413).json({
+        error: `Image too large — max ${MAX_IMAGE_BYTES / (1024 * 1024)}MB`,
+        code: "VALIDATION_ERROR",
+      });
+      return;
+    }
+    if (err) {
+      next(err);
+      return;
+    }
+    next();
+  });
+}, async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = (req.body as { userId?: string }).userId;
   if (!userId) {
@@ -560,7 +575,10 @@ router.post("/:id/respond-image", upload.single("image"), async (req: Request, r
     return;
   }
   if (!req.file) {
-    res.status(400).json({ error: "image file is required (field 'image', max 5MB, jpeg/png/webp/heic)", code: "VALIDATION_ERROR" });
+    res.status(400).json({
+      error: `image file is required (field 'image', max ${MAX_IMAGE_BYTES / (1024 * 1024)}MB, ${[...IMAGE_MIME_TYPES].join("/")})`,
+      code: "VALIDATION_ERROR",
+    });
     return;
   }
 
