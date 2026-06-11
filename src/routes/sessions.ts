@@ -90,6 +90,14 @@ const GetOutputQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(1000).default(200),
 });
 
+const DevServerSchema = z.object({
+  port: z.number().int().min(1).max(65535),
+});
+
+const PreviewUrlSchema = z.object({
+  previewUrl: z.string().url(),
+});
+
 const AppendDiffSchema = z.object({
   toolUseId: z.string().min(1),
   path: z.string().min(1),
@@ -509,6 +517,8 @@ router.get("/:id", async (req: Request, res: Response) => {
     stats: data.stats ?? null,
     agentSessionId: data.agentSessionId ?? null,
     shortId: data.shortId ?? null,
+    devServerPort: data.devServerPort ?? null,
+    previewUrl: data.previewUrl ?? null,
   });
 });
 
@@ -526,6 +536,55 @@ router.patch("/:id/agent-session", async (req: Request, res: Response) => {
 
   await sessionRef(id).update({ agentSessionId: parse.data.agentSessionId });
   console.log(`[session] agentSessionId saved session=${id}`);
+  res.status(200).json({ ok: true });
+});
+
+// PATCH /sessions/:id/dev-server — CLI reports a detected local dev server port
+router.patch("/:id/dev-server", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const parse = DevServerSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: parse.error.message, code: "VALIDATION_ERROR" });
+    return;
+  }
+
+  const data = await getSessionOrFail(id, res);
+  if (!data) return;
+
+  await sessionRef(id).update({ devServerPort: parse.data.port });
+  console.log(`[session] devServerPort=${parse.data.port} session=${id}`);
+  res.status(200).json({ ok: true });
+});
+
+// POST /sessions/:id/preview/request — mobile requests a live preview tunnel
+router.post("/:id/preview/request", async (req: Request, res: Response) => {
+  const { id } = req.params;
+
+  const data = await getSessionOrFail(id, res);
+  if (!data) return;
+
+  await sessionRef(id).update({ previewRequested: true });
+  console.log(`[session] preview requested session=${id}`);
+  res.status(200).json({ ok: true });
+});
+
+// PATCH /sessions/:id/preview — CLI reports the live tunnel URL
+router.patch("/:id/preview", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const parse = PreviewUrlSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: parse.error.message, code: "VALIDATION_ERROR" });
+    return;
+  }
+
+  const data = await getSessionOrFail(id, res);
+  if (!data) return;
+
+  await sessionRef(id).update({
+    previewUrl: parse.data.previewUrl,
+    previewRequested: false,
+  });
+  console.log(`[session] previewUrl set session=${id} url=${parse.data.previewUrl}`);
   res.status(200).json({ ok: true });
 });
 
@@ -614,9 +673,12 @@ router.get("/:id/response", async (req: Request, res: Response) => {
     return;
   }
 
-  const pending = snap.data()?.pendingResponse;
+  const sessionData = snap.data()!;
+  const previewRequested = sessionData.previewRequested ?? false;
+
+  const pending = sessionData.pendingResponse;
   if (!pending) {
-    res.status(200).json({ response: null });
+    res.status(200).json({ response: null, previewRequested });
     return;
   }
 
@@ -627,7 +689,7 @@ router.get("/:id/response", async (req: Request, res: Response) => {
   });
 
   console.log(`[session] response consumed session=${id} action="${pending.action}"`);
-  res.status(200).json({ response: pending.action as string, type: (pending.type as string) ?? "text" });
+  res.status(200).json({ response: pending.action as string, type: (pending.type as string) ?? "text", previewRequested });
 });
 
 // DELETE /sessions/:id/leave — removes only this user's membership (pivot row)

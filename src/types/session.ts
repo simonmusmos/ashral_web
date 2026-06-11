@@ -15,6 +15,9 @@ export interface Session {
   expiresAt: FirebaseFirestore.Timestamp;
   lastOutputAt?: FirebaseFirestore.Timestamp;
   outputChunkCount?: number;
+  devServerPort?: number | null;
+  previewUrl?: string | null;
+  previewRequested?: boolean;
 }
 
 export interface UserSession {
