@@ -10,6 +10,8 @@ import { SessionStatus } from "../types/session";
 
 const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"]);
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+// Keeps a chunk doc well under Firestore's 1 MiB limit even for 4-byte UTF-8
+const MAX_CHUNK_CHARS = 200_000;
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -71,8 +73,14 @@ const UpdateMemberSchema = z.object({
 });
 
 const AppendOutputSchema = z.object({
-  text: z.string().min(1).max(16000),
+  text: z.string().min(1).max(MAX_CHUNK_CHARS),
   stream: z.enum(["stdout", "stderr"]).default("stdout"),
+  // Client-generated ID — makes retries idempotent (same chunkId = same doc)
+  chunkId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional(),
+  // Set when one message is split across several chunks; clients merge parts
+  messageId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional(),
+  part: z.number().int().min(0).optional(),
+  parts: z.number().int().min(1).optional(),
 });
 
 const UpdateStatsSchema = z.object({
@@ -88,6 +96,13 @@ const CompleteSessionSchema = z.object({
 
 const GetOutputQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(1000).default(200),
+  // Return only chunks with seq > afterSeq. Omit to get the latest `limit` chunks.
+  afterSeq: z.coerce.number().int().min(0).optional(),
+});
+
+const GetDiffsQuerySchema = z.object({
+  // Epoch millis — return only diffs created at or after this time
+  since: z.coerce.number().int().min(0).optional(),
 });
 
 const DevServerSchema = z.object({
@@ -127,6 +142,25 @@ function outputRef(sessionId: string) {
   return sessionRef(sessionId).collection("output");
 }
 
+// Queue of messages from mobile → CLI, consumed in order by GET /response
+function inboxRef(sessionId: string) {
+  return sessionRef(sessionId).collection("inbox");
+}
+
+function serializeChunk(doc: FirebaseFirestore.QueryDocumentSnapshot) {
+  const chunk = doc.data();
+  return {
+    chunkId: doc.id,
+    seq: (chunk.seq as number | undefined) ?? null,
+    text: chunk.text,
+    stream: chunk.stream,
+    messageId: chunk.messageId ?? null,
+    part: chunk.part ?? null,
+    parts: chunk.parts ?? null,
+    createdAt: chunk.createdAt,
+  };
+}
+
 async function getSessionOrFail(
   sessionId: string,
   res: Response
@@ -137,6 +171,21 @@ async function getSessionOrFail(
     return null;
   }
   return snap.data()!;
+}
+
+async function enqueueResponse(
+  sessionId: string,
+  response: { type: "text" | "image"; action: string }
+): Promise<void> {
+  const batch = getFirestore().batch();
+  batch.set(inboxRef(sessionId).doc(), {
+    ...response,
+    createdAt: admin.firestore.Timestamp.now(),
+  });
+  batch.update(sessionRef(sessionId), {
+    pendingAction: admin.firestore.FieldValue.delete(),
+  });
+  await batch.commit();
 }
 
 // ─── Semver helpers ──────────────────────────────────────────────────────────
@@ -300,9 +349,9 @@ router.patch("/:id/status", async (req: Request, res: Response) => {
     update.pendingAction = pendingAction;
   } else if (status === "running") {
     update.pendingAction = admin.firestore.FieldValue.delete();
-    // pendingResponse is NOT cleared here — it is only consumed by GET /response.
-    // Clearing it here races with the mobile app sending a new message immediately
-    // after the CLI picks up the previous one.
+    // Queued inbox responses are NOT cleared here — they are only consumed by
+    // GET /response, so a message sent right after the CLI picks up the previous
+    // one is never lost.
   }
 
   await sessionRef(id).update(update);
@@ -312,6 +361,8 @@ router.patch("/:id/status", async (req: Request, res: Response) => {
 });
 
 // POST /sessions/:id/output
+// Assigns each chunk a per-session sequence number (seq) inside a transaction,
+// so readers can page with ?afterSeq= and ordering never depends on clock time.
 router.post("/:id/output", async (req: Request, res: Response) => {
   const { id } = req.params;
   const parse = AppendOutputSchema.safeParse(req.body);
@@ -320,32 +371,61 @@ router.post("/:id/output", async (req: Request, res: Response) => {
     return;
   }
 
-  const data = await getSessionOrFail(id, res);
-  if (!data) return;
+  const { text, stream, messageId, part, parts } = parse.data;
+  const chunkId = parse.data.chunkId ?? uuidv4();
+  const chunkRef = outputRef(id).doc(chunkId);
 
-  const chunkId = uuidv4();
-  const createdAt = admin.firestore.Timestamp.now();
-  const { text, stream } = parse.data;
+  const result = await getFirestore().runTransaction(async (t) => {
+    const [sessionSnap, chunkSnap] = await Promise.all([
+      t.get(sessionRef(id)),
+      t.get(chunkRef),
+    ]);
+    if (!sessionSnap.exists) return null;
 
-  const batch = getFirestore().batch();
-  batch.set(outputRef(id).doc(chunkId), {
-    text,
-    stream,
-    createdAt,
+    // Retry of a chunk we already stored — return the original
+    if (chunkSnap.exists) {
+      const existing = chunkSnap.data()!;
+      return { seq: existing.seq as number, createdAt: existing.createdAt, duplicate: true };
+    }
+
+    const session = sessionSnap.data()!;
+    // Sessions created before seq existed fall back to their chunk count
+    const seq = ((session.outputSeq ?? session.outputChunkCount ?? 0) as number) + 1;
+    const createdAt = admin.firestore.Timestamp.now();
+
+    t.set(chunkRef, {
+      seq,
+      text,
+      stream,
+      createdAt,
+      ...(messageId !== undefined && { messageId }),
+      ...(part !== undefined && { part }),
+      ...(parts !== undefined && { parts }),
+    });
+    t.update(sessionRef(id), {
+      outputSeq: seq,
+      lastOutputAt: createdAt,
+      outputChunkCount: admin.firestore.FieldValue.increment(1),
+    });
+    return { seq, createdAt, duplicate: false };
   });
-  batch.update(sessionRef(id), {
-    lastOutputAt: createdAt,
-    outputChunkCount: admin.firestore.FieldValue.increment(1),
-  });
-  await batch.commit();
+
+  if (!result) {
+    res.status(404).json({ error: "Session not found", code: "NOT_FOUND" });
+    return;
+  }
 
   console.log(
-    `[output] appended session=${id} chunk=${chunkId} stream=${stream} chars=${text.length}`
+    `[output] appended session=${id} chunk=${chunkId} seq=${result.seq} stream=${stream} chars=${text.length}${result.duplicate ? " (duplicate)" : ""}`
   );
-  res.status(201).json({ ok: true, chunkId, createdAt });
+  res.status(201).json({ ok: true, chunkId, seq: result.seq, createdAt: result.createdAt });
 });
 
 // GET /sessions/:id/output
+//   ?afterSeq=N  → chunks with seq > N, oldest first (incremental polling)
+//   (no afterSeq) → the latest `limit` chunks, oldest first (initial load)
+// `lastSeq` is the cursor to pass as afterSeq next time; `hasMore` means the
+// limit was hit and the client should fetch again straight away.
 router.get("/:id/output", async (req: Request, res: Response) => {
   const { id } = req.params;
   const parse = GetOutputQuerySchema.safeParse(req.query);
@@ -354,25 +434,38 @@ router.get("/:id/output", async (req: Request, res: Response) => {
     return;
   }
 
+  // Read the session before the chunks: every chunk with seq <= outputSeq was
+  // committed together with that value, so the query below is sure to see it.
   const data = await getSessionOrFail(id, res);
   if (!data) return;
+  const sessionSeq = (data.outputSeq as number | undefined) ?? 0;
 
-  const chunksSnap = await outputRef(id)
-    .orderBy("createdAt", "asc")
-    .limit(parse.data.limit)
-    .get();
+  const { limit, afterSeq } = parse.data;
+  let chunks: ReturnType<typeof serializeChunk>[];
+  let hasMore: boolean;
 
-  const chunks = chunksSnap.docs.map((doc) => {
-    const chunk = doc.data();
-    return {
-      chunkId: doc.id,
-      text: chunk.text,
-      stream: chunk.stream,
-      createdAt: chunk.createdAt,
-    };
-  });
+  if (afterSeq !== undefined) {
+    const snap = await outputRef(id)
+      .where("seq", ">", afterSeq)
+      .orderBy("seq", "asc")
+      .limit(limit)
+      .get();
+    chunks = snap.docs.map(serializeChunk);
+    hasMore = snap.size === limit;
+  } else {
+    // createdAt (not seq) so chunks written before seq existed are included
+    const snap = await outputRef(id)
+      .orderBy("createdAt", "desc")
+      .limit(limit)
+      .get();
+    chunks = snap.docs.map(serializeChunk).reverse();
+    hasMore = false;
+  }
 
-  res.status(200).json({ chunks });
+  const maxReturned = chunks.reduce((m, c) => Math.max(m, c.seq ?? 0), 0);
+  const lastSeq = hasMore ? maxReturned : Math.max(sessionSeq, maxReturned, afterSeq ?? 0);
+
+  res.status(200).json({ chunks, lastSeq, hasMore });
 });
 
 // POST /sessions/:id/notify
@@ -424,11 +517,17 @@ router.post("/:id/reactivate", async (req: Request, res: Response) => {
     return;
   }
 
-  await sessionRef(id).update({
+  // Drop messages queued while the session was down — same as the old
+  // single-slot pendingResponse, which was cleared here too
+  const inboxSnap = await inboxRef(id).get();
+  const batch = getFirestore().batch();
+  inboxSnap.docs.forEach((doc) => batch.delete(doc.ref));
+  batch.update(sessionRef(id), {
     status: "active" as SessionStatus,
     pendingAction: admin.firestore.FieldValue.delete(),
     pendingResponse: admin.firestore.FieldValue.delete(),
   });
+  await batch.commit();
 
   console.log(`[session] reactivated session=${id}`);
   res.status(200).json({ ok: true });
@@ -600,11 +699,7 @@ router.post("/:id/respond", async (req: Request, res: Response) => {
   const data = await getSessionOrFail(id, res);
   if (!data) return;
 
-  const now = admin.firestore.Timestamp.now();
-  await sessionRef(id).update({
-    pendingResponse: { action: parse.data.action, respondedAt: now },
-    pendingAction: admin.firestore.FieldValue.delete(),
-  });
+  await enqueueResponse(id, { type: "text", action: parse.data.action });
 
   console.log(`[session] respond session=${id} userId=${parse.data.userId} action="${parse.data.action}"`);
   res.status(200).json({ ok: true });
@@ -654,42 +749,40 @@ router.post("/:id/respond-image", (req: Request, res: Response, next: NextFuncti
     expires: Date.now() + 24 * 60 * 60 * 1000,
   });
 
-  const now = admin.firestore.Timestamp.now();
-  await sessionRef(id).update({
-    pendingResponse: { type: "image", action: url, respondedAt: now },
-    pendingAction: admin.firestore.FieldValue.delete(),
-  });
+  await enqueueResponse(id, { type: "image", action: url });
 
   console.log(`[session] respond-image session=${id} userId=${userId} path=${objectPath}`);
   res.status(200).json({ ok: true });
 });
 
-// GET /sessions/:id/response — CLI polls for a pending response (one-time read)
+// GET /sessions/:id/response — CLI polls for the next queued mobile response.
+// Pops the oldest inbox entry in a transaction so each one is delivered exactly once.
 router.get("/:id/response", async (req: Request, res: Response) => {
   const { id } = req.params;
-  const snap = await sessionRef(id).get();
-  if (!snap.exists) {
+
+  const sessionSnap = await sessionRef(id).get();
+  if (!sessionSnap.exists) {
     res.status(404).json({ error: "Session not found", code: "NOT_FOUND" });
     return;
   }
+  const previewRequested = (sessionSnap.data()!.previewRequested as boolean | undefined) ?? false;
 
-  const sessionData = snap.data()!;
-  const previewRequested = sessionData.previewRequested ?? false;
+  // Only the inbox is read in the transaction — keeps the session doc out of
+  // the lock set so this 2s poll never contends with output writes.
+  const next = await getFirestore().runTransaction(async (t) => {
+    const inboxSnap = await t.get(inboxRef(id).orderBy("createdAt", "asc").limit(1));
+    const doc = inboxSnap.docs[0];
+    if (doc) t.delete(doc.ref);
+    return doc?.data();
+  });
 
-  const pending = sessionData.pendingResponse;
-  if (!pending) {
+  if (!next) {
     res.status(200).json({ response: null, previewRequested });
     return;
   }
 
-  // Consume and clear the response atomically
-  await sessionRef(id).update({
-    pendingResponse: admin.firestore.FieldValue.delete(),
-    pendingAction: admin.firestore.FieldValue.delete(),
-  });
-
-  console.log(`[session] response consumed session=${id} action="${pending.action}"`);
-  res.status(200).json({ response: pending.action as string, type: (pending.type as string) ?? "text", previewRequested });
+  console.log(`[session] response consumed session=${id} action="${next.action}"`);
+  res.status(200).json({ response: next.action as string, type: (next.type as string) ?? "text", previewRequested });
 });
 
 // DELETE /sessions/:id/leave — removes only this user's membership (pivot row)
@@ -721,10 +814,12 @@ router.delete("/:id", async (req: Request, res: Response) => {
     .where("sessionId", "==", id)
     .get();
   const outputSnap = await outputRef(id).get();
+  const inboxSnap = await inboxRef(id).get();
 
   const batch = getFirestore().batch();
   membersSnap.docs.forEach((doc) => batch.delete(doc.ref));
   outputSnap.docs.forEach((doc) => batch.delete(doc.ref));
+  inboxSnap.docs.forEach((doc) => batch.delete(doc.ref));
   batch.delete(sessionRef(id));
   await batch.commit();
 
@@ -758,17 +853,25 @@ router.post("/:id/diffs", async (req: Request, res: Response) => {
 });
 
 // GET /sessions/:id/diffs — mobile fetches all file diffs for a session
+// ?since=<epoch ms> returns only diffs created at or after that time (inclusive,
+// so clients should dedupe by toolUseId).
 router.get("/:id/diffs", async (req: Request, res: Response) => {
   const { id } = req.params;
+  const parse = GetDiffsQuerySchema.safeParse(req.query);
+  if (!parse.success) {
+    res.status(400).json({ error: parse.error.message, code: "VALIDATION_ERROR" });
+    return;
+  }
   const snap = await sessionRef(id).get();
   if (!snap.exists) {
     res.status(404).json({ error: "Session not found" });
     return;
   }
-  const diffsSnap = await sessionRef(id)
-    .collection('fileDiffs')
-    .orderBy('createdAt', 'asc')
-    .get();
+  let query: FirebaseFirestore.Query = sessionRef(id).collection('fileDiffs');
+  if (parse.data.since !== undefined) {
+    query = query.where('createdAt', '>=', admin.firestore.Timestamp.fromMillis(parse.data.since));
+  }
+  const diffsSnap = await query.orderBy('createdAt', 'asc').get();
   const diffs = diffsSnap.docs.map((doc) => {
     const d = doc.data();
     return {

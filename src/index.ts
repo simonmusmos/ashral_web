@@ -9,7 +9,8 @@ getFirebaseApp();
 
 const app = express();
 
-app.use(express.json());
+// Output chunks can be up to 200k chars (see MAX_CHUNK_CHARS in routes/sessions)
+app.use(express.json({ limit: "1mb" }));
 
 // Health check
 app.get("/health", (_req: Request, res: Response) => {
